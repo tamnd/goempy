@@ -11,14 +11,15 @@ on:
 env:
   PYTHON_STANDALONE_VERSIONS: |
     [
-      "20241219"
+      "20260414"
     ]
   PYTHON_VERSIONS: |
     [
-      "3.10.16",
-      "3.11.11",
-      "3.12.8",
-      "3.13.1",
+      "3.10.17",
+      "3.11.13",
+      "3.12.11",
+      "3.13.3",
+      "3.14.4"
     ]
 
 jobs:
@@ -40,7 +41,7 @@ jobs:
         pythonStandaloneVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_STANDALONE_VERSIONS) }}
         pythonVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_VERSIONS) }}
       fail-fast: false
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: clone
         run: |
@@ -61,11 +62,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.19
+          go-version: '1.24'
       - name: build-tag
         run: |
           git config --global user.email "no@mail.exists"
-          git config --global user.name "go-embed-python releaser"
+          git config --global user.name "goempy releaser"
           BUILD_NUM=$(./hack/next-build-num.sh ${{ matrix.pythonStandaloneVersion }} ${{ matrix.pythonVersion }})
           ./hack/build-tag.sh ${{ matrix.pythonStandaloneVersion }} ${{ matrix.pythonVersion }} $BUILD_NUM
           echo $BUILD_NUM > build-num
@@ -89,9 +90,9 @@ jobs:
     strategy:
       matrix:
         os:
-          - ubuntu-22.04
-          - macos-13
-          - windows-2022
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
         pythonStandaloneVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_STANDALONE_VERSIONS) }}
         pythonVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_VERSIONS) }}
       fail-fast: false
@@ -111,7 +112,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.19
+          go-version: '1.24'
       - name: run tests
         shell: bash
         run: |
@@ -126,7 +127,7 @@ jobs:
         pythonStandaloneVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_STANDALONE_VERSIONS) }}
         pythonVersion: ${{ fromJSON(needs.build-matrix.outputs.PYTHON_VERSIONS) }}
       fail-fast: false
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
     permissions:
       contents: write

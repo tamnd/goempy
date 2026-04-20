@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"github.com/kluctl/go-embed-python/pip"
-	"github.com/kluctl/go-embed-python/python"
+	"github.com/tamnd/goempy/pip"
+	"github.com/tamnd/goempy/python"
 	"io"
 	"net/http"
 	"os"
@@ -45,8 +45,14 @@ func bootstrapPip(ep *python.EmbeddedPython) {
 	}
 }
 
+// getPipURL bootstraps pip inside the freshly-extracted interpreter. The
+// unversioned bootstrap.pypa.io/get-pip.py URL silently switches away from
+// versions that still support older CPython releases, so we pin to the Python
+// 3.14-era bootstrap that ships pip 25.x.
+const getPipURL = "https://bootstrap.pypa.io/pip/get-pip.py"
+
 func downloadGetPip() string {
-	resp, err := http.Get("https://bootstrap.pypa.io/get-pip.py")
+	resp, err := http.Get(getPipURL)
 	if err != nil {
 		panic(err)
 	}

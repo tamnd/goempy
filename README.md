@@ -1,17 +1,18 @@
-# Embedded Python Interpreter for Go
+# goempy — Embedded Python 3.14 for Go
 
-This library provides an embedded distribution of Python, which should work out-of-the box on a selected set of
-architectures and operating systems.
+`goempy` ships a ready-to-run CPython interpreter inside your Go binary. No
+CGo, no system Python, no external runtime — just `go get`, embed, and exec.
 
-This library does not require CGO and solely relies on executing Python inside another process. It does not rely
-on CPython binding to work. There is also no need to have Python pre-installed on the target host.
+It is a modernized fork of [`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python)
+tracking Python 3.14 and the Astral [`python-build-standalone`](https://github.com/astral-sh/python-build-standalone)
+releases.
 
-You really only have to depend on this library and invoke it as follows:
+## Quick start
 
 ```go
 import (
-	"github.com/kluctl/go-embed-python/python"
 	"os"
+	"github.com/tamnd/goempy/python"
 )
 
 func main() {
@@ -19,70 +20,63 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer ep.Cleanup()
 
-	cmd, err := ep.PythonCmd("-c", "print('hello')")
+	cmd, err := ep.PythonCmd("-c", "print('hello from embedded python')")
 	if err != nil {
 		panic(err)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		panic(err)
-	}
+	_ = cmd.Run()
 }
 ```
 
-## Supported architectures
-The following operating systems and architectures are supported:
-* darwin-amd64
-* darwin-arm64
-* linux-amd64
-* linux-arm64
-* windows-amd64
+## Supported platforms
+
+| OS      | Arch  | PBS triple                         |
+|---------|-------|-------------------------------------|
+| linux   | amd64 | `x86_64-unknown-linux-gnu`          |
+| linux   | arm64 | `aarch64-unknown-linux-gnu`         |
+| darwin  | amd64 | `x86_64-apple-darwin`               |
+| darwin  | arm64 | `aarch64-apple-darwin`              |
+| windows | amd64 | `x86_64-pc-windows-msvc` (non-shared) |
+
+Planned: `windows/arm64`, `linux/musl`, free-threaded (PEP 703) builds.
+
+## Supported Python versions
+
+Primary: **3.14.4**. Also shipped: 3.13.3, 3.12.11, 3.11.13, 3.10.17.
 
 ## Releases
-Releases in this library are handled a bit different from what one might be used to. This library does currently not
-follow a versioning schema comparable to sematic versioning. This might however change in the future.
 
-Right now, every tagged release is compromised of the Python interpreter version, the [python-standalone](https://github.com/astral-sh/python-build-standalone)
-and a build number. For example, the release version `v0.0.0-3.11.6-20241219-2` belongs to Python version 3.11.6, 
-the [20241219](https://github.com/astral-sh/python-build-standalone/releases/tag/20241219) version of python-standalone
-and build number 2. The release version currently always has v0.0.0 as its own version.
+Tag format: `v0.0.0-<python>-<pbs>-<build>`, e.g. `v0.0.0-3.14.4-20260414-1`.
+The `v0.0.0` prefix is intentional — this library does not follow semver.
+The meaningful identifier is the `<python>-<pbs>` pair. Pin exactly.
 
-The way versioning is handled might result in popular dependency management tools (e.g. dependabot) to not work as you
-might require it. Please watch out to not accidentally upgrade your Python version!
+> Dependabot and similar tools may mis-resolve upgrades against this scheme.
+> Review Python version bumps manually.
 
 ## How it works
-This library uses the standalone Python distributions found at https://github.com/astral-sh/python-build-standalone as
-the base.
 
-The `./hack/build-tag.sh` script is used to invoke `python/generate` and `pip/generate`, which then downloads, extracts
-and packages all supported Python distributions. The script then also creates a tag which then can be used as a dependency
-in your project.
+1. At release time, `python/generate` downloads each `(python, pbs, platform)`
+   triple from python-build-standalone, strips unused stdlib, and writes a
+   per-platform directory to `python/internal/data/<os>-<arch>/`.
+2. `embed_util.CopyForEmbed` compresses each file (gzip) and emits
+   `//go:embed` targets with build constraints so only the host's bytes are
+   linked into the final binary.
+3. At runtime, `python.NewEmbeddedPython` extracts its `embed.FS` into
+   `$TMPDIR/go-embedded-<name>-<hash>`, guarded by `flock`, and returns an
+   `exec.Cmd` factory.
 
-The tagged release internally embed all Python sources and binaries via `//go:embed`. The `EmbeddedPython` object
-is then used as a helper utility to access the embedded distribution.
+## Embedding Python libraries
 
-`EmbeddedPython` is created via `NewEmbeddedPython`, which will extract the embedded distribution into a temporary folder.
-Extraction is optimized in a way that it is only executed when needed (by verifying integrity of previously extracted
-distributions).
-
-## Upgrading python
-The Python version and downloaded distributions are controlled via the `.github/workflows/release.yml` workflow. It
-contains a matrix of supported distributions. To upgrade Python, edit this workflow and create a pull request.
-
-## Embedding Python libraries into your applications
-This library provides utilities/helpers to allow embedding of external libraries into your own application.
-
-To do this, create a simple generator application inside your application/library, for example in `internal/my-python-libs/generate/main.go`:
+Create `internal/mylib/generate/main.go`:
 
 ```go
 package main
 
-import (
-	"github.com/kluctl/go-embed-python/pip"
-)
+import "github.com/tamnd/goempy/pip"
 
 func main() {
 	err := pip.CreateEmbeddedPipPackagesForKnownPlatforms("requirements.txt", "./data/")
@@ -92,37 +86,40 @@ func main() {
 }
 ```
 
-Then create add the `//go:generate go run ./generate` statement to a .go file above the generator source, e.g. in `internal/my-python-libs/dummy.go`:
+Add `//go:generate go run ./generate` and a `requirements.txt` next to it, then
+`go generate ./...`. The generated `data.Data` `embed.FS` is passed to
+`embed_util.NewEmbeddedFiles()` and wired into the interpreter via
+`AddPythonPath`.
+
+A working example lives in [`example/`](./example).
+
+## Upgrading Python
+
+Edit `.github/workflows/release.yml`:
+
+```yaml
+PYTHON_STANDALONE_VERSIONS: ["20260414"]
+PYTHON_VERSIONS: ["3.10.17", "3.11.13", "3.12.11", "3.13.3", "3.14.4"]
 ```
-package internal
 
-//go:generate go run ./generate
-```
+Open a PR — CI will build the full matrix and tag on merge.
 
-And the requirements.txt in `internal/my-python-libs/requirements.txt`:
-```
-jinja2==3.1.2
-```
+## Why fork?
 
-When running `go generate ./...` inside your application/library, you'll get the referenced Python libraries installed
-to `internal/my-python-libs/data`. The embedded data is then available via `data.Data` and can be passed to
-`embed_util.NewEmbeddedFiles()` for extraction.
+Upstream `kluctl/go-embed-python` has been largely dormant since early 2025.
+The Python 3.14 upgrade PR has sat open since February. `goempy` picks up:
 
-The path returned by `EmbeddedFiles.GetExtractedPath()` can then be added to the `EmbeddedPython` by calling
-`AddPythonPath` on it.
+- Python 3.14.4 + python-build-standalone `20260414`
+- Windows dist name fix (PBS dropped the `shared-` infix)
+- Go 1.24 toolchain, `log/slog` (drop `logrus`)
+- pip 25.2, pinned `get-pip.py`
 
-An example of all this can be found in https://github.com/kluctl/go-jinja2
+See [spec 0967](../../notes/Spec/0900/0967_go_embed_python.md) for the upgrade
+rationale and roadmap.
 
-# Why another go+python solution?
-There are already multiple implementations of go-bindings for Python, which however all rely on CGO and/or dynamic
-linking. I experimented a lot with these and was not able to make it stable enough so that I could use it without fear
-of the process crashing after some time. I even got to the point where I implemented my own dynamic library loader that
-was not depending on CGO, but ultimately gave up when I realized that it would not work on all platforms.
+## License
 
-The only solution that was left was to spawn a Python process and use some kind of inter-process communication. For this
-to work reliably, without any dependencies on the host system, it was required to embed a fully working Python
-distribution into my Go binaries. I managed to make this flexible enough to put into a library so that others might
-benefit as well.
+Apache-2.0 — same as upstream. See [`LICENSE`](./LICENSE).
 
-Initially, this approach/code was part of https://github.com/kluctl/kluctl to allow Jinja2 templates in Go. The Jinja2
-part can now be found in https://github.com/kluctl/go-jinja2.
+Original authorship: kluctl contributors. Modernization fork: Duc-Tam Nguyen
+&lt;tamnd@liteio.dev&gt;.
