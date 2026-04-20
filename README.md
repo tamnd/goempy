@@ -114,8 +114,10 @@ each target directory using the same `embed_util.CopyForEmbed` helper.
 
 The release workflow finishes by committing
 `python/internal/data/` and `pip/internal/data/` to a detached branch
-and tagging it as `v0.0.0-<python>-<pbs>-<build>`. The main branch stays
-slim because the binary data never lives on it.
+and tagging it. The primary Python line (currently 3.14) gets a clean
+`v<lib>` tag, so `go get @latest` resolves to it. Secondary lines get
+a semver prerelease suffix like `v<lib>-py3.13.13`. The main branch
+stays slim because the binary data never lives on it.
 
 ### Build time
 
@@ -280,19 +282,22 @@ One `release.yml` matrix run produces all of them.
 
 ## Release tag scheme
 
-```
-v0.0.0-3.14.4-20260414-1
-        │      │       └─ build number (re-runs of the same pair)
-        │      └────────── python-build-standalone release date tag
-        └───────────────── CPython version
-```
+Each release produces one tag per supported Python line. The primary
+line (3.14 right now) gets a clean semver tag. The other lines get
+valid semver prereleases so that `go get @latest` always lands on
+the primary:
 
-The `v0.0.0` prefix is deliberate. This library does not follow semver,
-and probably never will. The meaningful identifier is the
-`<python>-<pbs>` suffix. Pin exactly that with `go get`.
+| CPython | Tag                  | How to pin                                        |
+|---------|----------------------|---------------------------------------------------|
+| 3.14.4  | `v0.1.0`             | `go get github.com/tamnd/goempy@latest`           |
+| 3.13.13 | `v0.1.0-py3.13.13`   | `go get github.com/tamnd/goempy@v0.1.0-py3.13.13` |
+| 3.12.13 | `v0.1.0-py3.12.13`   | `go get github.com/tamnd/goempy@v0.1.0-py3.12.13` |
+| 3.11.15 | `v0.1.0-py3.11.15`   | `go get github.com/tamnd/goempy@v0.1.0-py3.11.15` |
+| 3.10.20 | `v0.1.0-py3.10.20`   | `go get github.com/tamnd/goempy@v0.1.0-py3.10.20` |
 
-Dependabot and similar tools tend to mis-resolve upgrades against this
-scheme. Bump Python versions by hand.
+The library version itself lives in the `VERSION` file at the repo
+root; the primary Python line lives in `PRIMARY_PYTHON`. Bumping
+either bumps every tag in the next release.
 
 ## Embedding pip packages
 
@@ -402,7 +407,7 @@ If this library helps you, please go star the upstream repository.
 Everything clever here is theirs.
 
 This fork adds, relative to the last upstream release
-(`v0.0.0-3.13.1-20241219-1`):
+(`v0.0.0-3.13.1-20241219-1` in the old scheme):
 
 - Python 3.14.4 and python-build-standalone 20260414.
 - Fix for the Windows PBS triple rename from
