@@ -1,16 +1,15 @@
 # goempy
 
-`goempy` bakes a working CPython 3.14 interpreter into your Go binary. Call
-`python.NewEmbeddedPython("myapp")`, get back an `*exec.Cmd` factory, and run
-Python code without any Python on the host — no `apt install python3`, no
-PyInstaller tricks, no CGo.
+`goempy` bakes a CPython 3.14 interpreter into your Go binary. You call
+`python.NewEmbeddedPython("myapp")`, you get back an `*exec.Cmd` factory,
+and you run Python code on hosts that have no Python installed. There is no
+CGo, no libpython to hunt for, no PyInstaller trick.
 
-It is a fork of [`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python)
-that I started in April 2026 because upstream had gone quiet and Python 3.14
-had just shipped. All of the hard design work — the per-file gzip layout, the
-flock-guarded extraction, the pip integration — is the original authors'.
-Everything in this tree is under Apache-2.0 and attributed accordingly (see
-[Credits](#credits)).
+This is a fork of [`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python).
+I started the fork in April 2026 after Python 3.14 shipped and upstream had
+been quiet for a few months. The design, the build pipeline, the pip
+integration, the runtime extractor: all of that is the original authors'
+work. See [Credits](#credits) for the full attribution.
 
 ```go
 package main
@@ -35,230 +34,270 @@ func main() {
 }
 ```
 
-Build that program with `go get github.com/tamnd/goempy@v0.0.0-3.14.4-20260414-1`
-and run it. The first invocation extracts about 22 MB of Python into
-`$TMPDIR/go-embedded-python-hello-<hash>/` and then executes
-`bin/python3 -c …`. Subsequent invocations reuse the same directory — the
-integrity check looks at file size and skips the copy if nothing has changed.
+Build that and run it. On the first invocation you get roughly 22 MB of
+Python extracted into `$TMPDIR/go-embedded-python-hello-<hash>/`. The
+binary then execs `bin/python3 -c …` as a subprocess. Subsequent
+invocations reuse the same directory. The integrity check compares each
+file's size on disk against the embedded manifest and skips writing when
+the two agree.
 
-## Why this exists
+## Why bother
 
-If you want to run Python from Go you have a few options, and most of them
-hurt:
+There are only a handful of ways to run Python from Go, and most of them
+are annoying.
 
-- **CGo + libpython** via
-  [`go-python/cpy3`](https://github.com/go-python/cpy3) or similar.
-  Requires the right libpython on the host at runtime. Cross-compiling is a
-  nightmare. Stability is fragile under load.
-- **A sidecar process** you ship alongside your binary. You own the
-  installation story for every platform.
-- **[PyOxidizer](https://github.com/indygreg/PyOxidizer) /
-  [pyembed](https://github.com/indygreg/PyOxidizer/tree/main/pyembed)**.
-  Rust-centric, in-process, heavyweight, and the project is effectively
-  abandoned.
+The CGo route with [`go-python/cpy3`](https://github.com/go-python/cpy3)
+and friends works, but you own the problem of getting the correct
+libpython onto every machine you ship to. Cross-compilation is painful.
+Long-running processes tend to pick up edge cases around the GIL and
+reference counting.
 
-`kluctl/go-embed-python` took a different route, which this fork inherits:
-**embed the entire stdlib + interpreter into the Go binary**, extract on
-first run, and call it as a subprocess. No CGo. No host dependencies. Cross
-compilation is just `GOOS=linux GOARCH=arm64 go build`.
+A sidecar Python install works, but then you are shipping an installer
+for each platform, and you cannot cleanly vendor your Python dependencies
+with `go get`.
 
-The size cost is real — a single-platform binary gains roughly 25–30 MB of
-compressed Python — but for CLI tools, operators, and GitOps controllers
-that want to embed templating engines or pure-Python libraries, it is the
-cleanest option I have found.
+[PyOxidizer](https://github.com/indygreg/PyOxidizer) and
+[pyembed](https://github.com/indygreg/PyOxidizer/tree/main/pyembed) embed
+CPython in-process, Rust-side, and the project is effectively parked.
+
+The approach in `kluctl/go-embed-python`, and now this fork, is to put
+the entire CPython tree into the Go binary via `//go:embed`, extract it
+on first run, and exec it as a subprocess. That trades about 25 to 30 MB
+of compressed binary size for a deployment story that is just `go build`.
+For CLI tools, Kubernetes operators, and GitOps controllers that want
+templating or a pure-Python library or two, I have not found a cleaner
+option.
 
 ## Architecture
 
-```
-┌───────────────────────── release-time (CI) ──────────────────────────┐
-│                                                                      │
-│   python/generate  ─┬─►  download PBS tarball   (─> tar.zst)          │
-│   (one per platform)│                                                 │
-│                     ├─►  zstd → tar → install/ tree                   │
-│                     │                                                 │
-│                     ├─►  strip stdlib: test, idlelib, lib2to3, ...    │
-│                     │                                                 │
-│                     └─►  embed_util.CopyForEmbed                      │
-│                              │                                        │
-│                              ▼                                        │
-│                 python/internal/data/<goos>-<goarch>/                 │
-│                    ├── bin/python3.gz   (per-file gzip -9)            │
-│                    ├── lib/python3.14/**/*.gz                         │
-│                    ├── files.json        (manifest + content hash)    │
-│                    └── symlinks preserved via manifest                │
-│                                                                      │
-│   pip/generate   ──► pip install -r requirements.txt --platform …     │
-│                      into python/internal/data/pip/  (same layout)    │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-               │                                       │
-               └──────────── git tag ──────────────────┘
-               v0.0.0-<python>-<pbs>-<build>
+There are three times that matter: release time (when CI builds the
+tagged artifact), build time (when a user compiles their app against a
+tag), and runtime (when that app runs).
 
-┌───────────────────────── build-time (user's app) ───────────────────┐
-│                                                                     │
-│   //go:embed all:linux-amd64        (build constraint per file)     │
-│   var _data embed.FS                                                │
-│   var Data, _ = fs.Sub(_data, "linux-amd64")                        │
-│                                                                     │
-│   ► go link only embeds the bytes for GOOS/GOARCH of the build.     │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+### Release time
 
-┌───────────────────────── runtime (user's app) ──────────────────────┐
-│                                                                     │
-│   python.NewEmbeddedPython(name)                                    │
-│       └─► embed_util.NewEmbeddedFiles(data.Data, "python-"+name)    │
-│              ├── read files.json from embed.FS                      │
-│              ├── compute SHA-256 hash of manifest                   │
-│              ├── extractedPath := $TMPDIR/go-embedded-<name>-<hash> │
-│              ├── flock(extractedPath + ".lock")   -- crash-safe     │
-│              ├── for each entry in manifest:                        │
-│              │     • if file exists and Size matches → skip         │
-│              │     • else gunzip from embed.FS → write to disk      │
-│              │     • replay symlinks from manifest                  │
-│              └── return EmbeddedFiles{extractedPath}                │
-│                                                                     │
-│       └─► NewPython(WithPythonHome(extractedPath))                  │
-│              returns an *exec.Cmd factory that sets PYTHONHOME and  │
-│              PYTHONPATH for you before exec.                        │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+`python/generate/main.go` runs once per `(python, pbs, platform)` tuple.
+For each tuple it does the following.
+
+It downloads the matching
+`cpython-<version>+<pbs>-<triple>-pgo+lto-full.tar.zst` asset from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone).
+Windows uses `pgo-full` (no LTO on MSVC builds).
+
+It decompresses with `klauspost/compress/zstd`, streams through
+`archive/tar`, and writes the result into a staging directory.
+
+It removes parts of the stdlib we do not want to carry. Right now the
+removal list is `ensurepip`, `idlelib`, `lib2to3`, `pydoc_data`,
+`site-packages`, `test`, `turtledemo`, and the stray `bin` directory
+that some packages install into.
+
+It runs `internal.CleanupPythonDir` to apply a keep-glob pattern. On
+Unix the keep list is `bin/**`, `lib/*.so*`, `lib/*.dylib`, and
+`lib/python3.*/**`. On Windows it is `Lib/**`, `DLLs/**`, `*.dll`, and
+`*.exe`. Everything else in the install tree gets deleted.
+
+It calls `embed_util.CopyForEmbed`, which walks the cleaned tree,
+gzip-compresses every regular file at `BestCompression`, preserves
+symlinks in a manifest, and writes the result to
+`python/internal/data/<goos>-<goarch>/`. The manifest lands in
+`files.json` alongside the compressed payload and is content-hashed.
+
+Finally it emits a small `embed_<goos>_<goarch>.go` stub with a build
+constraint and a `//go:embed all:<goos>-<goarch>` directive so the Go
+compiler picks up only the right platform's bytes.
+
+`pip/generate` does roughly the same thing for pip-installed wheels.
+It drives the freshly-extracted interpreter through `pip install -r
+requirements.txt --platform <tag> --only-binary=:all:`, then packs
+each target directory using the same `embed_util.CopyForEmbed` helper.
+
+The release workflow finishes by committing
+`python/internal/data/` and `pip/internal/data/` to a detached branch
+and tagging it as `v0.0.0-<python>-<pbs>-<build>`. The main branch stays
+slim because the binary data never lives on it.
+
+### Build time
+
+In a user's application you write `import "github.com/tamnd/goempy/python"`
+and pin a specific release tag. The Go compiler resolves that tag,
+pulls in the tree with the committed `python/internal/data/`, and
+evaluates the per-platform `embed.go` files. Each file looks like this:
+
+```go
+//go:build linux && amd64
+
+package data
+
+import (
+	"embed"
+	"io/fs"
+)
+
+//go:embed all:linux-amd64
+var _data embed.FS
+var Data, _ = fs.Sub(_data, "linux-amd64")
 ```
+
+The build constraints mean the linker only embeds the bytes for the
+`GOOS`/`GOARCH` combo you are compiling for. A `GOOS=linux GOARCH=arm64`
+build pulls in one `linux-arm64` tree and nothing else.
+
+### Runtime
+
+`python.NewEmbeddedPython(name)` is the only entry point most users
+need. Under the hood:
+
+```
+NewEmbeddedPython(name)
+  └─ embed_util.NewEmbeddedFiles(data.Data, "python-"+name)
+        ├─ read files.json from embed.FS
+        ├─ compute SHA-256 of the manifest
+        ├─ extractedPath := $TMPDIR/go-embedded-<name>-<hash[:16]>
+        ├─ flock(extractedPath + ".lock")   // serialize peers
+        ├─ walk manifest:
+        │     • if target exists and Size matches → skip
+        │     • else gunzip from embed.FS → write to disk
+        │     • replay symlinks through the manifest
+        └─ return EmbeddedFiles{extractedPath}
+  └─ NewPython(WithPythonHome(extractedPath))
+```
+
+The hash suffix in the directory name lets two differently-versioned
+binaries on the same machine coexist without stepping on each other.
+The flock lock means two copies of the same binary starting at the same
+time will not race to extract into the same directory.
 
 ### The pieces
 
-`internal/tar.go`
- : Streaming zstd → tar extractor used at release time. Handles regular
-   files, directories, symlinks. Hardlinks currently raise an error (see
-   [#7](#roadmap)).
+`internal/tar.go` is a streaming zstd→tar extractor used at release
+time. It handles regular files, directories, and symlinks. Hardlinks
+currently error out, which is fine for CPython but worth knowing if
+you fork this for a different payload.
 
-`internal/cleanup_python.go`
- : Applies a glob-based keep-list to the extracted PBS install tree,
-   removing test suites, documentation, IDLE, tkinter demos, and other
-   stdlib weight we do not want to ship.
+`internal/cleanup_python.go` holds the glob-driven keep-list that
+trims the stdlib. This is where you tweak things if you want to ship
+or drop a particular module.
 
-`embed_util/file_list.go`
- : Defines `fileList` / `fileListEntry`. Each entry records mode, size,
-   compression flag, and symlink target. The full list is serialized to
-   `files.json` and hashed to form the extraction directory suffix.
+`embed_util/file_list.go` defines `fileList` and `fileListEntry`.
+Each entry records name, mode, size, compression flag, and symlink
+target. The full list is what gets serialized into `files.json`.
 
-`embed_util/packer.go`
- : Walks the cleaned install tree, gzip-compresses each regular file at
-   `BestCompression`, and writes `*.gz` alongside a manifest. Also
-   generates the per-platform `embed_<os>_<arch>.go` stub that the Go
-   compiler consumes via `//go:embed all:<os>-<arch>`.
+`embed_util/packer.go` does the release-time packing. It walks the
+install tree and compresses each regular file individually using
+`compress/gzip` at `BestCompression`. It also writes the
+`embed_<os>_<arch>.go` stub.
 
-`embed_util/embedded_files.go`
- : The runtime extractor. Takes any `fs.FS` (so you can also embed your
-   own pip packages), resolves symlinks through the manifest, and writes
-   to a per-hash directory under `$TMPDIR`. A `gofrs/flock` lock serializes
-   concurrent extractions so that multiple processes in the same host
-   cannot race.
+`embed_util/embedded_files.go` is the runtime extractor. It takes any
+`fs.FS`, so the same code extracts both the interpreter and your own
+pip-packed packages. Symlinks resolve through the manifest rather than
+through the host filesystem, which matters because `embed.FS` cannot
+represent symlinks natively.
 
-`python/embedded_python.go`
- : The user-facing `EmbeddedPython` type. Couples an `EmbeddedFiles`
-   (extraction) with a `Python` (exec.Cmd factory). `PYTHONHOME` is wired
-   up automatically; call `AddPythonPath(dir)` to splice additional
-   directories — normally the extracted path of a pip-packed `embed.FS`.
+`python/embedded_python.go` ties `EmbeddedFiles` to a `Python`
+interface. The `Python` interface is a thin wrapper around
+`exec.Command` that sets `PYTHONHOME` and `PYTHONPATH` for you.
+`AddPythonPath(dir)` splices an additional directory in, which is how
+you wire pip-packed packages into the interpreter.
 
-`pip/*`
- : Build-time helpers that shell out to the embedded pip (25.2 at the
-   time of writing) with `--platform` filters to fetch cross-platform
-   wheels into `./data/<goos>-<goarch>/`. You wire this into your own
-   project with a `//go:generate go run ./generate` stub.
+`pip/pip_lib.go` and `pip/embed_pip_packages.go` are build-time helpers
+that package pip itself (already embedded in `pip/internal/data/`) and
+run it against a user's `requirements.txt`. Platform selection uses
+pip's `--platform` flag with hardcoded tags that map to the supported
+`(goos, goarch)` matrix.
 
-### Why per-file gzip instead of a single tarball
+### Per-file gzip vs one big tarball
 
-The obvious alternative is a single `.tar.zst` blob extracted on first
-run. The original authors chose per-file gzip and that choice still pays
-off:
+The obvious alternative to per-file gzip is a single `.tar.zst` blob
+that gets extracted on first run. The original authors picked per-file
+gzip and I agree with the choice.
 
-1. `embed.FS` lookups are path-based. Per-file entries let runtime check
-   whether a file already exists on disk at the right size and skip it
-   — the "unchanged" fast path turns second-run extraction into a few
-   hundred `stat` calls.
-2. Partial extracts fail gracefully. If the process is killed in the
-   middle of extraction, the next run resumes per-file without having
-   to redecompress a 100 MB archive.
-3. gzip is in the Go standard library. zstd would shave 15–30 % off the
-   compressed size — there is an open thought in [`#roadmap`](#roadmap)
-   to swap it — but it is not free; the packer already depends on
-   `klauspost/compress` for the release-time tarball, so the trade-off
-   is mostly about runtime decompressor choice.
+First, `embed.FS` lookups are path-based. Per-file entries let the
+extractor `stat` each target, compare sizes, and skip writes when the
+disk is already in sync with the manifest. The second-run fast path
+is a few hundred syscalls and no decompression.
+
+Second, partial extracts degrade gracefully. Kill the process halfway
+through first-run extraction and the next run resumes one file at a
+time instead of having to redecompress a 100 MB archive.
+
+Third, gzip is in the standard library. zstd would shave 15 to 30
+percent off the compressed payload and the packer already pulls in
+`klauspost/compress` for the release-time tarball, so switching is
+not much work. It is on the [Roadmap](#roadmap); it just hasn't
+bubbled to the top.
 
 ### python-build-standalone
 
-The Python distributions themselves come from
+The actual Python distributions come from
 [`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone)
-(PBS), which ships fully relocatable, statically-linked, PGO+LTO CPython
-builds with pinned OpenSSL, sqlite, libexpat, etc. That project does
-almost all of the interesting work — CPython builds that are actually
-portable across glibc versions are not easy.
+(PBS). That project produces fully relocatable, statically-linked,
+PGO+LTO CPython builds with pinned OpenSSL, sqlite, libexpat, ncurses,
+and so on. Portable CPython is harder than it sounds and they are the
+people who have actually solved it.
 
-PBS was originally maintained by Gregory Szorc as part of the
-[PyOxidizer](https://github.com/indygreg/PyOxidizer) effort under
-`indygreg/python-build-standalone`. Astral (the `uv` / `ruff` folks)
-took over the project in early 2024 and it is now the foundation for
-`uv python install`, Astral's own Python installer. `goempy` rides on
-top of the same releases.
+PBS was originally Gregory Szorc's project under
+`indygreg/python-build-standalone`, built to support
+[PyOxidizer](https://github.com/indygreg/PyOxidizer). Astral, the team
+behind `uv` and `ruff`, took over maintenance in early 2024. It now
+underpins `uv python install` and is one of the load-bearing pieces of
+the modern Python packaging stack.
 
-`python/generate/main.go` downloads the `*-pgo+lto-full.tar.zst` (or
-`*-pgo-full.tar.zst` on Windows — PBS does not do LTO on MSVC builds)
-for each (`goos`, `goarch`) in the matrix. A `--only-platforms` flag is
-available for local development.
+`goempy` pulls the `*-pgo+lto-full.tar.zst` build on Unix and the
+`*-pgo-full.tar.zst` build on Windows (no LTO on MSVC). For local
+development the generator accepts a `--only-platforms=darwin/arm64`
+flag so you can iterate without downloading all five builds.
 
 ## Supported platforms
 
-| GOOS    | GOARCH | PBS triple                         | LTO | Notes                                    |
-|---------|--------|-------------------------------------|-----|------------------------------------------|
-| linux   | amd64  | `x86_64-unknown-linux-gnu`          | yes | glibc ≥ 2.17 (manylinux_2_17)            |
-| linux   | arm64  | `aarch64-unknown-linux-gnu`         | yes | upgraded to pgo+lto in PBS 20260414      |
-| darwin  | amd64  | `x86_64-apple-darwin`               | yes | macOS 11+ (x86_64)                       |
-| darwin  | arm64  | `aarch64-apple-darwin`              | yes | macOS 11+ (Apple Silicon)                |
-| windows | amd64  | `x86_64-pc-windows-msvc`            | no  | non-shared libpython; `.exe` entry point |
+| GOOS    | GOARCH | PBS triple                   | LTO | Notes                              |
+|---------|--------|------------------------------|-----|------------------------------------|
+| linux   | amd64  | `x86_64-unknown-linux-gnu`   | yes | glibc ≥ 2.17 (manylinux_2_17)      |
+| linux   | arm64  | `aarch64-unknown-linux-gnu`  | yes | PGO+LTO since PBS 20260414         |
+| darwin  | amd64  | `x86_64-apple-darwin`        | yes | macOS 11+                          |
+| darwin  | arm64  | `aarch64-apple-darwin`       | yes | macOS 11+ on Apple Silicon         |
+| windows | amd64  | `x86_64-pc-windows-msvc`     | no  | non-shared libpython; `.exe` entry |
 
-Not yet wired up (PBS has the artifacts, just not in this fork's matrix):
-`windows/arm64`, `linux/musl-{amd64,arm64}`, Linux micro-arch variants
-(`x86_64_v{2,3,4}`), Android, Emscripten, and the free-threaded (PEP 703)
-builds. See [Roadmap](#roadmap).
+Not yet wired up: `windows/arm64`, `linux/musl` (amd64 and arm64),
+`x86_64_v{2,3,4}` micro-arch Linux builds, Android, Emscripten, and
+the free-threaded (PEP 703) variants. PBS has all of those; the
+matrix in `release.yml` just does not enumerate them yet.
 
 ## Supported Python versions
 
-Each release tag is a `(python, pbs)` pair. As of the first `goempy`
-release (April 2026), PBS 20260414 ships:
+Each tag is one `(python, pbs)` pair. As of the first `goempy` release
+in April 2026, PBS 20260414 ships:
 
-| Python  | Status   | Notes                                                  |
-|---------|----------|---------------------------------------------------------|
-| 3.14.4  | primary  | PEP 703 GIL-disable available via free-threaded builds |
-| 3.13.13 | stable   |                                                         |
-| 3.12.13 | stable   |                                                         |
-| 3.11.15 | stable   |                                                         |
-| 3.10.20 | sunsetting | CPython upstream EOL October 2026                    |
+| Python  | Status     | Notes                                                |
+|---------|------------|------------------------------------------------------|
+| 3.14.4  | primary    | free-threaded builds available but not yet packaged  |
+| 3.13.13 | stable     |                                                      |
+| 3.12.13 | stable     |                                                      |
+| 3.11.15 | stable     |                                                      |
+| 3.10.20 | sunsetting | CPython upstream EOL in October 2026                 |
 
-All of them build from a single `release.yml` matrix.
+One `release.yml` matrix run produces all of them.
 
-## Release tags
-
-Tag format: `v0.0.0-<python>-<pbs>-<build>`. Example:
+## Release tag scheme
 
 ```
 v0.0.0-3.14.4-20260414-1
-        │      │       └─ build number (for re-releases of the same pair)
+        │      │       └─ build number (re-runs of the same pair)
         │      └────────── python-build-standalone release date tag
         └───────────────── CPython version
 ```
 
-The leading `v0.0.0` is intentional — this library does not follow semver
+The `v0.0.0` prefix is deliberate. This library does not follow semver,
 and probably never will. The meaningful identifier is the
-`<python>-<pbs>` suffix. `go get` against a specific tag to pin. Dependabot
-and similar tools may mis-resolve upgrades against this scheme; review
-Python version bumps manually.
+`<python>-<pbs>` suffix. Pin exactly that with `go get`.
+
+Dependabot and similar tools tend to mis-resolve upgrades against this
+scheme. Bump Python versions by hand.
 
 ## Embedding pip packages
 
-The same machinery that packs CPython also packs pip-installed
-dependencies into a per-platform `embed.FS`. Inside your repo:
+The same packer that produces the interpreter also packs pip-installed
+wheels into a per-platform `embed.FS`. In your repo:
 
 ```go
 // internal/mylib/generate/main.go
@@ -267,16 +306,17 @@ package main
 import "github.com/tamnd/goempy/pip"
 
 func main() {
-	if err := pip.CreateEmbeddedPipPackagesForKnownPlatforms(
+	err := pip.CreateEmbeddedPipPackagesForKnownPlatforms(
 		"requirements.txt",
 		"./data/",
-	); err != nil {
+	)
+	if err != nil {
 		panic(err)
 	}
 }
 ```
 
-```
+```go
 // internal/mylib/dummy.go
 package mylib
 
@@ -290,131 +330,142 @@ jinja2==3.1.4
 
 Then `go generate ./internal/mylib/...`. The generator downloads wheels
 for every `(goos, goarch)` in the matrix using
-`pip install --platform … --only-binary=:all:`, packs each target directory
-the same way the interpreter is packed, and emits a `data.Data` `embed.FS`
-per platform. At runtime:
+`pip install --platform … --only-binary=:all:` and writes each target
+directory out using the same packing logic. At runtime:
 
 ```go
 libs, _ := embed_util.NewEmbeddedFiles(data.Data, "mylib-pip")
 ep.AddPythonPath(libs.GetExtractedPath())
+
 cmd, _ := ep.PythonCmd("-c", "import jinja2; print(jinja2.__version__)")
 ```
 
-A working example is the [`example/`](./example) directory in this repo,
-and a much more complete one lives in
-[`kluctl/go-jinja2`](https://github.com/kluctl/go-jinja2) (which is where
-this pattern was originally battle-tested).
+The [`example/`](./example) directory in this repo has a small working
+version. [`kluctl/go-jinja2`](https://github.com/kluctl/go-jinja2) has
+a much fuller one, and that was where the pattern was first
+stress-tested in production.
 
 ## Roadmap
 
-Things I want to do, in roughly decreasing priority:
+Rough order of what I want to tackle next:
 
-1. **Fix the manifest integrity check.** Current "unchanged" fast path
-   compares only `Size()`. Across a 3.13 → 3.14 upgrade, same-named
-   stdlib files can have identical sizes and stale bytes on disk survive
-   the check. Use the per-entry content hash that already exists in
-   `files.json`.
-2. **Windows path normalization.** When the packer runs on Windows,
-   `filepath.Separator` leaks into `files.json` entries as `\`. Force
-   `/` everywhere in the manifest. (Carries intent of upstream PR #50.)
-3. **Per-file zstd** instead of gzip. Pure-Go decoder via
-   `klauspost/compress/zstd`; saves 15–30 % of embedded bytes.
-4. **`windows/arm64`, `linux/musl-{amd64,arm64}`** in the matrix.
-5. **Free-threaded (PEP 703) variants** as an opt-in matrix axis. PBS
-   already ships `*-freethreaded+pgo-full.tar.zst` everywhere that
-   matters.
-6. **Lazy extract**: a single compressed blob + streaming extract on
-   first `PythonCmd` call. Optional mode — the per-file layout stays
-   default for the fast-skip path.
-7. **Android / iOS triples**. PBS 20260414 has Android, and 3.14 makes
-   it tier-3.
+1. Fix the manifest integrity check. The runtime "unchanged" path
+   compares only `Size()`, which can return a false positive across a
+   Python upgrade if a stdlib file happens to keep the same byte
+   count. The manifest already carries a content hash; use it.
+2. Normalize path separators in the manifest when the packer runs on
+   Windows. Currently `filepath.Separator` leaks into `files.json`
+   as `\`, which breaks the per-entry lookup at runtime.
+3. Switch per-file compression from gzip to zstd. Pure-Go decoder
+   via `klauspost/compress/zstd`, already a transitive dependency.
+4. Add `windows/arm64` and `linux/musl` (amd64 and arm64) to the
+   matrix. PBS ships them.
+5. Opt-in free-threaded (PEP 703) builds as a matrix axis.
+6. A lazy extract mode: ship a single compressed blob and stream-extract
+   on first `PythonCmd` call. Would be an option, not the default; the
+   per-file layout is worth keeping for the skip-on-unchanged fast path.
+7. Android and iOS triples. PBS 20260414 has Android, and Python 3.14
+   promoted it to tier-3.
 
 Contributions welcome.
 
 ## Non-goals
 
-- **In-process Python via CGo.** Explicitly out of scope. If you want
-  that, use `go-python/cpy3` or PyOxidizer and make peace with libpython.
-- **Python → Go bindings.** Use
-  [`go-python/gopy`](https://github.com/go-python/gopy) for that.
-- **A general-purpose `embed.FS` compressor.** The `embed_util` package
-  is not trying to be one, even though it could look like one. It is
-  tuned for (large, many-file, partially-symlinked Python trees).
+In-process Python via CGo is explicitly out of scope. If that is what
+you want, go with `go-python/cpy3` or PyOxidizer and make peace with
+shipping libpython.
+
+Python-calls-Go or Go-calls-Python bindings are also out of scope.
+[`go-python/gopy`](https://github.com/go-python/gopy) is the project
+for that, and it composes fine with this one.
+
+A general-purpose `embed.FS` compressor is not something I want
+`embed_util` to become, even though it could look like one. The
+package is tuned for the particular shape of a CPython install tree:
+many small files, some symlinks, no hardlinks, predictable layout.
 
 ## Credits
 
-### Upstream authors
+### Upstream: kluctl/go-embed-python
 
-All of the design and the vast majority of the code in this repository
-come from the original
-[`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python),
-authored by Alexander Block ([@codablock](https://github.com/codablock))
-and contributors in the Kluctl organization. The project was extracted
-from [`kluctl/kluctl`](https://github.com/kluctl/kluctl), a Kubernetes
-GitOps tool, where it was used to ship Jinja2 templating without
-depending on a system Python. If this library helps you, star the
-[upstream repo](https://github.com/kluctl/go-embed-python) first.
+The original work, and the overwhelming majority of the code in this
+repository, is
+[`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python).
+It was written by Alexander Block
+([@codablock](https://github.com/codablock)) and the Kluctl
+contributors. The project was extracted from
+[`kluctl/kluctl`](https://github.com/kluctl/kluctl), a Kubernetes GitOps
+tool where it was originally used to embed Jinja2 templating without a
+system Python dependency.
 
-This fork adds:
+If this library helps you, please go star the upstream repository.
+Everything clever here is theirs.
 
-- Python 3.14.4 + python-build-standalone `20260414`
-- Fix for the Windows PBS triple rename (`pc-windows-msvc-shared-pgo-full`
-  → `pc-windows-msvc-pgo-full`) that silently broke the 3.14 download path
-- Upgrade of `linux/arm64` to PGO+LTO (PBS now ships it)
-- Go toolchain 1.19 → 1.24, `log/slog` in place of `sirupsen/logrus`
-- pip 24.3.1 → 25.2, with explicit `setuptools>=75` / `wheel>=0.45` pins
-- `--only-platforms` on the generator for scoped local builds
-- Docs rewritten
+This fork adds, relative to the last upstream release
+(`v0.0.0-3.13.1-20241219-1`):
 
-Individual file headers retain their original attribution and Apache-2.0
-licensing. Nothing in this fork is relicensed.
+- Python 3.14.4 and python-build-standalone 20260414.
+- Fix for the Windows PBS triple rename from
+  `pc-windows-msvc-shared-pgo-full` to `pc-windows-msvc-pgo-full`.
+  Without it, the 3.14 download silently 404'd on Windows.
+- Upgrade of `linux/arm64` to PGO+LTO. PBS used to ship only
+  `lto-full` for aarch64 Linux and now ships `pgo+lto-full`.
+- Go toolchain 1.19 to 1.24. `sirupsen/logrus` replaced by the
+  standard library's `log/slog`.
+- pip 24.3.1 to 25.2, with `setuptools>=75` and `wheel>=0.45` pinned
+  explicitly so that `get-pip.py` cannot drift to older versions.
+- A `--only-platforms` flag on `python/generate` so you can build
+  one platform locally instead of all five.
+- Docs rewrite.
+
+Individual file headers keep their original attribution. The project
+stays Apache-2.0. Nothing is relicensed.
 
 ### python-build-standalone
 
-The Python distributions themselves are
-[`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone),
-originally
+The CPython builds we redistribute come from
+[`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone).
+Before Astral took over, the project was
 [`indygreg/python-build-standalone`](https://github.com/indygreg/python-build-standalone)
-by Gregory Szorc. Astral took maintenance over in 2024 and it is now one
-of the two or three most important projects in the Python packaging
-ecosystem. Everything in this fork rests on their work.
+and was maintained by Gregory Szorc. Portable CPython is a hard
+problem and this project is one of the quiet load-bearing pieces of
+the Python packaging ecosystem.
 
 ## Related projects
 
 Things you might want instead, or alongside:
 
-- **[kluctl/go-embed-python](https://github.com/kluctl/go-embed-python)**
-  — upstream. Use this if you are on Python ≤ 3.13 and the last upstream
-  release meets your needs.
-- **[kluctl/go-jinja2](https://github.com/kluctl/go-jinja2)** — Jinja2
+- [`kluctl/go-embed-python`](https://github.com/kluctl/go-embed-python).
+  Upstream. If you are on Python 3.13 or earlier and the last upstream
+  release meets your needs, use this.
+- [`kluctl/go-jinja2`](https://github.com/kluctl/go-jinja2). Jinja2
   templating for Go, implemented by driving an embedded Python
-  subprocess. Best real-world consumer of `go-embed-python` and a useful
-  reference for how to wire pip-embedded libraries into it.
-- **[kluctl/kluctl](https://github.com/kluctl/kluctl)** — the GitOps
-  tool where this code originated.
-- **[astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone)**
-  — the portable CPython builds we redistribute. Read their release
+  subprocess. The best worked example of how to wire a pip-packed
+  `embed.FS` into an `EmbeddedPython`.
+- [`kluctl/kluctl`](https://github.com/kluctl/kluctl). Kubernetes
+  GitOps tool. Where this code originally came from.
+- [`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone).
+  The portable CPython builds we redistribute. Read their release
   notes before upgrading.
-- **[astral-sh/uv](https://github.com/astral-sh/uv)** — a Rust-based
-  Python package / project manager that also consumes PBS. Conceptual
-  sibling: if you are a Rust shop, `uv` does for Rust binaries what
-  `goempy` does for Go binaries (minus the CGo-free subprocess model).
-- **[indygreg/PyOxidizer](https://github.com/indygreg/PyOxidizer)** and
-  **[pyembed](https://github.com/indygreg/PyOxidizer/tree/main/pyembed)**
-  — the other approach: in-process CPython linked into a single binary.
-  Largely unmaintained at this point.
-- **[go-python/gopy](https://github.com/go-python/gopy)** — generate Go
-  bindings for Python packages. Different problem; they complement each
-  other.
-- **[go-python/cpy3](https://github.com/go-python/cpy3)** — direct CGo
-  bindings to libpython. What you use if you really want to call Python
-  in-process and do not care about deployment pain.
-- **[cibuildwheel](https://github.com/pypa/cibuildwheel)** — worth a
-  read for the cross-platform CI matrix patterns we imitate.
+- [`astral-sh/uv`](https://github.com/astral-sh/uv). Rust-based Python
+  package and project manager. Also consumes PBS under the hood. If
+  you are reaching for Python from Rust, `uv` does roughly what
+  `goempy` does from Go, minus the subprocess model.
+- [`indygreg/PyOxidizer`](https://github.com/indygreg/PyOxidizer) and
+  its [`pyembed`](https://github.com/indygreg/PyOxidizer/tree/main/pyembed)
+  crate. The other approach: in-process CPython linked into a single
+  binary. Mostly unmaintained now.
+- [`go-python/gopy`](https://github.com/go-python/gopy). Generator for
+  Go bindings to Python packages. Different problem; complementary.
+- [`go-python/cpy3`](https://github.com/go-python/cpy3). Direct CGo
+  bindings to libpython. What you use if you truly want in-process
+  Python and can live with the deployment pain.
+- [`pypa/cibuildwheel`](https://github.com/pypa/cibuildwheel). Useful
+  reading for the cross-platform CI matrix patterns we imitate.
 
 ## License
 
-Apache-2.0, the same as upstream. See [`LICENSE`](./LICENSE).
+Apache-2.0, same as upstream. See [`LICENSE`](./LICENSE).
 
 Original copyright: Kluctl contributors. Fork maintenance: Duc-Tam
 Nguyen &lt;tamnd@liteio.dev&gt;.
