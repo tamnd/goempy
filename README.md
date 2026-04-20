@@ -46,7 +46,7 @@ Planned: `windows/arm64`, `linux/musl`, free-threaded (PEP 703) builds.
 
 ## Supported Python versions
 
-Primary: **3.14.4**. Also shipped: 3.13.3, 3.12.11, 3.11.13, 3.10.17.
+Primary: **3.14.4**. Also shipped: 3.13.13, 3.12.13, 3.11.15, 3.10.20.
 
 ## Releases
 
@@ -99,7 +99,7 @@ Edit `.github/workflows/release.yml`:
 
 ```yaml
 PYTHON_STANDALONE_VERSIONS: ["20260414"]
-PYTHON_VERSIONS: ["3.10.17", "3.11.13", "3.12.11", "3.13.3", "3.14.4"]
+PYTHON_VERSIONS: ["3.10.20", "3.11.15", "3.12.13", "3.13.13", "3.14.4"]
 ```
 
 Open a PR — CI will build the full matrix and tag on merge.
