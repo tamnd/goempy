@@ -1,12 +1,11 @@
-module github.com/kluctl/go-embed-python
+module github.com/tamnd/goempy
 
-go 1.19
+go 1.24
 
 require (
 	github.com/gobwas/glob v0.2.3
 	github.com/gofrs/flock v0.12.1
 	github.com/klauspost/compress v1.17.11
-	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/sync v0.10.0
 )

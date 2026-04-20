@@ -3,17 +3,18 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/gobwas/glob"
-	"github.com/klauspost/compress/zstd"
-	"github.com/kluctl/go-embed-python/embed_util"
-	"github.com/kluctl/go-embed-python/internal"
-	log "github.com/sirupsen/logrus"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/gobwas/glob"
+	"github.com/klauspost/compress/zstd"
+	"github.com/tamnd/goempy/embed_util"
+	"github.com/tamnd/goempy/internal"
 )
 
 var (
@@ -22,6 +23,7 @@ var (
 	preparePath             = flag.String("prepare-path", filepath.Join(os.TempDir(), "python-download"), "specify the path where the python executables are downloaded and prepared. automatically creates a temporary directory if unset")
 	runPrepare              = flag.Bool("prepare", true, "if set, python executables will be downloaded and prepared for packing at the configured path")
 	runPack                 = flag.Bool("pack", true, "if set, previously prepared python executables will be packed into their redistributable form")
+	onlyPlatforms           = flag.String("only-platforms", "", "comma-separated list of os/arch pairs to generate (e.g. 'linux/amd64,darwin/arm64'); default is all supported")
 	pythonVersionBase       string
 )
 
@@ -61,11 +63,13 @@ func main() {
 	flag.Parse()
 
 	if *pythonVersion == "" || *pythonStandaloneVersion == "" {
-		log.Fatal("missing flags")
+		slog.Error("missing flags")
+		os.Exit(1)
 	}
 
-	log.Infof("python-standalone-version=%s", *pythonStandaloneVersion)
-	log.Infof("python-version=%s", *pythonVersion)
+	slog.Info("generating",
+		"python-standalone-version", *pythonStandaloneVersion,
+		"python-version", *pythonVersion)
 
 	pythonVersionBase = strings.Join(strings.Split(*pythonVersion, ".")[0:2], ".")
 
@@ -82,11 +86,30 @@ func main() {
 
 	jobs := []job{
 		{"linux", "amd64", "unknown-linux-gnu-pgo+lto-full", keepNixPatterns},
-		{"linux", "arm64", "unknown-linux-gnu-lto-full", keepNixPatterns},
+		{"linux", "arm64", "unknown-linux-gnu-pgo+lto-full", keepNixPatterns},
 		{"darwin", "amd64", "apple-darwin-pgo+lto-full", keepNixPatterns},
 		{"darwin", "arm64", "apple-darwin-pgo+lto-full", keepNixPatterns},
-		{"windows", "amd64", "pc-windows-msvc-shared-pgo-full", keepWinPatterns},
+		{"windows", "amd64", "pc-windows-msvc-pgo-full", keepWinPatterns},
 	}
+
+	if *onlyPlatforms != "" {
+		want := map[string]bool{}
+		for _, p := range strings.Split(*onlyPlatforms, ",") {
+			want[strings.TrimSpace(p)] = true
+		}
+		filtered := jobs[:0]
+		for _, j := range jobs {
+			if want[j.os+"/"+j.arch] {
+				filtered = append(filtered, j)
+			}
+		}
+		jobs = filtered
+		if len(jobs) == 0 {
+			slog.Error("no platforms matched filter", "filter", *onlyPlatforms)
+			os.Exit(1)
+		}
+	}
+
 	for _, j := range jobs {
 		j := j
 		wg.Add(1)
@@ -109,7 +132,7 @@ func downloadAndPrepare(osName string, arch string, dist string, keepPatterns []
 	extractPath := downloadPath + ".extracted"
 	err := os.RemoveAll(extractPath)
 	if err != nil {
-		log.Panic(err)
+		panic(err)
 	}
 
 	extract(downloadPath, extractPath)
@@ -160,7 +183,7 @@ func packPrepared(osName string, arch string, dist string, targetPath string) {
 func generateDownloadPath(arch string, dist string) string {
 	pythonArch, ok := archMapping[arch]
 	if !ok {
-		log.Errorf("arch %s not supported", arch)
+		slog.Error("arch not supported", "arch", arch)
 		os.Exit(1)
 	}
 	fname := fmt.Sprintf("cpython-%s+%s-%s-%s.tar.zst", *pythonVersion, *pythonStandaloneVersion, pythonArch, dist)
@@ -176,33 +199,37 @@ func download(osName string, arch string, dist string) string {
 	downloadUrl := fmt.Sprintf("https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s", *pythonStandaloneVersion, fname)
 
 	if _, err := os.Stat(downloadPath); err == nil {
-		log.Infof("skipping download of %s", downloadUrl)
+		slog.Info("skipping download", "url", downloadUrl)
 		return downloadPath
 	}
 
 	err := os.MkdirAll(filepath.Dir(downloadPath), 0o755)
 	if err != nil {
-		log.Errorf("mkdirs failed: %v", err)
+		slog.Error("mkdirs failed", "err", err)
 		os.Exit(1)
 	}
-	log.Infof("downloading %s", downloadUrl)
+	slog.Info("downloading", "url", downloadUrl)
 
 	r, err := http.Get(downloadUrl)
 	if err != nil {
-		log.Errorf("download failed: %v", err)
+		slog.Error("download failed", "err", err)
 		os.Exit(1)
 	}
 	if r.StatusCode == http.StatusNotFound {
-		log.Errorf("404 not found")
+		slog.Error("404 not found", "url", downloadUrl)
 		os.Exit(1)
 	}
 	defer r.Body.Close()
 
 	fileData, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error("reading response failed", "err", err)
+		os.Exit(1)
+	}
 
 	err = os.WriteFile(downloadPath, fileData, 0o640)
 	if err != nil {
-		log.Errorf("writing file failed: %v", err)
+		slog.Error("writing file failed", "err", err)
 		os.Remove(downloadPath)
 		os.Exit(1)
 	}
@@ -213,22 +240,22 @@ func download(osName string, arch string, dist string) string {
 func extract(archivePath string, targetPath string) string {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		log.Errorf("opening file failed: %v", err)
+		slog.Error("opening file failed", "err", err)
 		os.Exit(1)
 	}
 	defer f.Close()
 
 	z, err := zstd.NewReader(f)
 	if err != nil {
-		log.Errorf("decompression failed: %v", err)
+		slog.Error("decompression failed", "err", err)
 		os.Exit(1)
 	}
 	defer z.Close()
 
-	log.Infof("decompressing %s", archivePath)
+	slog.Info("decompressing", "path", archivePath)
 	err = internal.ExtractTarStream(z, targetPath)
 	if err != nil {
-		log.Errorf("decompression failed: %v", err)
+		slog.Error("decompression failed", "err", err)
 		os.Exit(1)
 	}
 

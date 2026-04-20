@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/kluctl/go-embed-python/python"
+	"github.com/tamnd/goempy/python"
 	"os"
 )
 

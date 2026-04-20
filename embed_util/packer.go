@@ -8,11 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func CopyForEmbed(out string, dir string) error {
@@ -21,7 +22,7 @@ func CopyForEmbed(out string, dir string) error {
 		return err
 	}
 
-	log.Infof("copying to %s with %d files", out, len(fl.Files))
+	slog.Info("copying for embed", "out", out, "files", len(fl.Files))
 	err = copyFiles(out, dir, fl)
 	if err != nil {
 		return err
